@@ -1,7 +1,7 @@
 import type { IAgentRuntime, Memory, Provider, State } from '@elizaos/core';
 
 export class TokenPriceProvider implements Provider {
-  async get(runtime: IAgentRuntime, message: Memory, _state?: State): Promise<string> {
+  async get(runtime: IAgentRuntime, message: Memory, _state?: State): Promise<string | null> {
     try {
       const content = typeof message.content === 'string' ? message.content : message.content?.text;
 
@@ -12,7 +12,8 @@ export class TokenPriceProvider implements Provider {
       // Extract token from content
       const tokenIdentifier = this.extractToken(content);
       if (!tokenIdentifier) {
-        throw new Error('Could not identify token in message');
+        // Return null instead of throwing error when no token found
+        return null;
       }
 
       console.log(`Fetching price for token: ${tokenIdentifier}`);

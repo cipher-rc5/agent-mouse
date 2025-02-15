@@ -2,6 +2,7 @@
 
 import { Character, Clients, ModelProviderName } from '@elizaos/core';
 import { dexScreenerPlugin } from '../plugins/plugin-dexscreener/src/index.ts';
+import { firecrawlPlugin } from '../plugins/plugin-firecrawl/src/index.ts';
 import { stargazePlugin } from '../plugins/plugin-stargaze/src/index.ts';
 import { twitterPlugin } from '../plugins/plugin-twitter/src/index.ts';
 import { webSearchPlugin } from '../plugins/plugin-web-search/src/index.ts';
@@ -9,7 +10,7 @@ import { webSearchPlugin } from '../plugins/plugin-web-search/src/index.ts';
 export const character: Character = {
   name: 'Mousekenstein',
   username: 'Mousekenstein',
-  plugins: [stargazePlugin, dexScreenerPlugin, webSearchPlugin, twitterPlugin],
+  plugins: [stargazePlugin, dexScreenerPlugin, webSearchPlugin, twitterPlugin, firecrawlPlugin],
   clients: [Clients.DISCORD],
   modelProvider: ModelProviderName.OPENAI,
   settings: { secrets: {}, voice: { model: 'en_US-male-medium' } },

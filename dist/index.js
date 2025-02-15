@@ -1,6 +1,6 @@
 // src/index.ts
 import { DirectClient } from "@elizaos/client-direct";
-import { AgentRuntime, elizaLogger as elizaLogger5, settings as settings3, stringToUuid } from "@elizaos/core";
+import { AgentRuntime, elizaLogger as elizaLogger11, settings as settings3, stringToUuid } from "@elizaos/core";
 import { bootstrapPlugin } from "@elizaos/plugin-bootstrap";
 import { createNodePlugin } from "@elizaos/plugin-node";
 import fs2 from "fs";
@@ -18,21 +18,716 @@ function initializeDbCache(character2, db) {
 // src/character.ts
 import { Clients, ModelProviderName } from "@elizaos/core";
 
+// plugins/plugin-dexscreener/src/providers/tokenProvider.ts
+var TokenPriceProvider = class {
+  async get(runtime, message, _state) {
+    try {
+      const content = typeof message.content === "string" ? message.content : message.content?.text;
+      if (!content) {
+        throw new Error("No message content provided");
+      }
+      const tokenIdentifier = this.extractToken(content);
+      if (!tokenIdentifier) {
+        return null;
+      }
+      console.log(`Fetching price for token: ${tokenIdentifier}`);
+      const isAddress = /^0x[a-fA-F0-9]{40}$/.test(tokenIdentifier) || /^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(tokenIdentifier);
+      const endpoint = isAddress ? `https://api.dexscreener.com/latest/dex/tokens/${tokenIdentifier}` : `https://api.dexscreener.com/latest/dex/search?q=${tokenIdentifier}`;
+      const response = await fetch(endpoint);
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.statusText}`);
+      }
+      const data = await response.json();
+      if (!data.pairs || data.pairs.length === 0) {
+        throw new Error(`No pricing data found for ${tokenIdentifier}`);
+      }
+      const bestPair = this.getBestPair(data.pairs);
+      return this.formatPriceData(bestPair);
+    } catch (error) {
+      console.error("TokenPriceProvider error:", error);
+      return `Error: ${error.message}`;
+    }
+  }
+  extractToken(content) {
+    const patterns = [
+      /0x[a-fA-F0-9]{40}/,
+      // ETH address
+      /[$#]([a-zA-Z0-9]+)/,
+      // $TOKEN or #TOKEN
+      /(?:price|value|worth|cost)\s+(?:of|for)\s+([a-zA-Z0-9]+)/i,
+      // "price of TOKEN"
+      /\b(?:of|for)\s+([a-zA-Z0-9]+)\b/i
+      // "of TOKEN"
+    ];
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match) {
+        const token = match[1] || match[0];
+        return token.replace(/[$#]/g, "").toLowerCase().trim();
+      }
+    }
+    return null;
+  }
+  getBestPair(pairs) {
+    return pairs.reduce((best, current) => {
+      const bestLiquidity = Number.parseFloat(best.liquidity?.usd || "0");
+      const currentLiquidity = Number.parseFloat(current.liquidity?.usd || "0");
+      return currentLiquidity > bestLiquidity ? current : best;
+    }, pairs[0]);
+  }
+  formatPriceData(pair) {
+    const price = Number.parseFloat(pair.priceUsd).toFixed(6);
+    const liquidity = Number.parseFloat(pair.liquidity?.usd || "0").toLocaleString();
+    const volume = Number.parseFloat(pair.volume?.h24 || "0").toLocaleString();
+    return `
+        The price of ${pair.baseToken.symbol} is $${price} USD, with liquidity of $${liquidity} and 24h volume of $${volume}.`;
+  }
+};
+var tokenPriceProvider = new TokenPriceProvider();
+
+// plugins/plugin-dexscreener/src/actions/tokenAction.ts
+var priceTemplate = `Determine if this is a token price request. If it is one of the specified situations, perform the corresponding action:
+
+Situation 1: "Get token price"
+- Message contains: words like "price", "value", "cost", "worth" AND a token symbol/address
+- Example: "What's the price of ETH?" or "How much is BTC worth?"
+- Action: Get the current price of the token
+
+Previous conversation for context:
+{{conversation}}
+
+You are replying to: {{message}}
+`;
+var TokenPriceAction = class {
+  name = "GET_TOKEN_PRICE";
+  similes = ["FETCH_TOKEN_PRICE", "CHECK_TOKEN_PRICE", "TOKEN_PRICE"];
+  description = "Fetches and returns token price information";
+  suppressInitialMessage = true;
+  template = priceTemplate;
+  async validate(_runtime, message) {
+    const content = typeof message.content === "string" ? message.content : message.content?.text;
+    if (!content) return false;
+    const hasPriceKeyword = /\b(price|value|worth|cost)\b/i.test(content);
+    const hasToken = /0x[a-fA-F0-9]{40}/.test(content) || /[$#]?[a-zA-Z0-9]+/i.test(content);
+    return hasPriceKeyword && hasToken;
+  }
+  async handler(runtime, message, state, _options = {}, callback) {
+    try {
+      const provider = runtime.providers.find((p) => p instanceof TokenPriceProvider);
+      if (!provider) {
+        throw new Error("Token price provider not found");
+      }
+      console.log("Fetching price data...");
+      const priceData = await provider.get(runtime, message, state);
+      console.log("Received price data:", priceData);
+      if (priceData.includes("Error")) {
+        throw new Error(priceData);
+      }
+      if (callback) {
+        await callback({ text: priceData, action: this.name });
+      }
+      if (state) {
+        state.responseData = { text: priceData, action: this.name };
+      }
+      return true;
+    } catch (error) {
+      console.error("Error in price action handler:", error);
+      if (callback) {
+        await callback({ text: `Sorry, I couldn't fetch the token price: ${error.message}`, action: this.name });
+      }
+      return false;
+    }
+  }
+  examples = [[{ user: "{{user}}", content: { text: "check price of eth" } }, {
+    user: "{{system}}",
+    content: {
+      text: "The current price of Ethereum (ETH) is $2,345.67 with a 24h trading volume of $9.87B. The liquidity pool holds $1.23B, and the price has changed +5.43% in the last 24 hours.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }], [{ user: "{{user}}", content: { text: "How much is BTC worth right now?" } }, {
+    user: "{{system}}",
+    content: {
+      text: "Bitcoin (BTC) is currently trading at $42,567.89. There's $15.23B in liquidity, with a 24h volume of $25.87B. The price is up 2.15% in the last 24 hours.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }], [{ user: "{{user}}", content: { text: "what's the current value of $bnb" } }, {
+    user: "{{system}}",
+    content: {
+      text: "Binance Coin (BNB) is priced at $345.67 with $5.23B in liquidity. The trading volume over the last 24h is $1.87B, and the price has decreased by 1.23% during this period.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }], [{ user: "{{user}}", content: { text: "can you tell me the price for USDT?" } }, {
+    user: "{{system}}",
+    content: {
+      text: "Tether (USDT) is maintaining its peg at $1.00 with minimal change (+0.01%). The token has $25.23B in liquidity and has seen $45.87B in trading volume over the past 24 hours.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }], [{ user: "{{user}}", content: { text: "show me the cost of #SOL" } }, {
+    user: "{{system}}",
+    content: {
+      text: "Solana (SOL) is trading at $123.45, showing strong momentum with an 8.75% increase in the last 24 hours. The liquidity stands at $3.23B with a 24h trading volume of $987.54M.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }], [{ user: "{{user}}", content: { text: "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0 price please" } }, {
+    user: "{{system}}",
+    content: {
+      text: "The price of Polygon (MATIC) is currently $1.23, up 3.45% in the past 24 hours. The token has $2.23B in liquidity and has seen $567.54M in trading volume today.",
+      action: "GET_TOKEN_PRICE"
+    }
+  }]];
+};
+var tokenPriceAction = new TokenPriceAction();
+
+// plugins/plugin-dexscreener/src/actions/trendsAction.ts
+import { elizaLogger, getEmbeddingZeroVector } from "@elizaos/core";
+var createTokenMemory = async (runtime, _message, formattedOutput) => {
+  const memory = {
+    userId: _message.userId,
+    agentId: _message.agentId,
+    roomId: _message.roomId,
+    content: { text: formattedOutput },
+    createdAt: Date.now(),
+    embedding: getEmbeddingZeroVector()
+  };
+  await runtime.messageManager.createMemory(memory);
+};
+var latestTokensTemplate = `Determine if this is a request for latest tokens. If it is one of the specified situations, perform the corresponding action:
+
+Situation 1: "Get latest tokens"
+- Message contains: words like "latest", "new", "recent" AND "tokens"
+- Example: "Show me the latest tokens" or "What are the new tokens?"
+- Action: Get the most recent tokens listed
+
+Previous conversation for context:
+{{conversation}}
+
+You are replying to: {{message}}
+`;
+var LatestTokensAction = class {
+  name = "GET_LATEST_TOKENS";
+  similes = ["FETCH_NEW_TOKENS", "CHECK_RECENT_TOKENS", "LIST_NEW_TOKENS"];
+  description = "Get the latest tokens from DexScreener API";
+  suppressInitialMessage = true;
+  template = latestTokensTemplate;
+  async validate(runtime, message) {
+    const content = typeof message.content === "string" ? message.content : message.content?.text;
+    if (!content) return false;
+    const hasLatestKeyword = /\b(latest|new|recent)\b/i.test(content);
+    const hasTokensKeyword = /\b(tokens?|coins?|crypto)\b/i.test(content);
+    return hasLatestKeyword && hasTokensKeyword;
+  }
+  async handler(runtime, message, state, _options = {}, callback) {
+    elizaLogger.log("Starting GET_LATEST_TOKENS handler...");
+    try {
+      const response = await fetch("https://api.dexscreener.com/token-profiles/latest/v1", {
+        method: "GET",
+        headers: { accept: "application/json" }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const tokens = await response.json();
+      const formattedOutput = tokens.map((token) => {
+        const description = token.description || "No description available";
+        return `Chain: ${token.chainId}
+Token Address: ${token.tokenAddress}
+URL: ${token.url}
+Description: ${description}
+
+`;
+      }).join("");
+      await createTokenMemory(runtime, message, formattedOutput);
+      if (callback) {
+        await callback({ text: formattedOutput, action: this.name });
+      }
+      return true;
+    } catch (error) {
+      elizaLogger.error("Error fetching latest tokens:", error);
+      if (callback) {
+        await callback({ text: `Failed to fetch latest tokens: ${error.message}`, action: this.name });
+      }
+      return false;
+    }
+  }
+  examples = [[{ user: "{{user}}", content: { text: "show me the latest tokens" } }, {
+    user: "{{system}}",
+    content: { text: "Here are the latest tokens added to DexScreener...", action: "GET_LATEST_TOKENS" }
+  }]];
+};
+var latestBoostedTemplate = `Determine if this is a request for latest boosted tokens. If it is one of the specified situations, perform the corresponding action:
+
+Situation 1: "Get latest boosted tokens"
+- Message contains: words like "latest", "new", "recent" AND "boosted tokens"
+- Example: "Show me the latest boosted tokens" or "What are the new promoted tokens?"
+- Action: Get the most recent boosted tokens
+
+Previous conversation for context:
+{{conversation}}
+
+You are replying to: {{message}}
+`;
+var LatestBoostedTokensAction = class {
+  name = "GET_LATEST_BOOSTED_TOKENS";
+  similes = ["FETCH_NEW_BOOSTED_TOKENS", "CHECK_RECENT_BOOSTED_TOKENS", "LIST_NEW_BOOSTED_TOKENS"];
+  description = "Get the latest boosted tokens from DexScreener API";
+  suppressInitialMessage = true;
+  template = latestBoostedTemplate;
+  async validate(runtime, message) {
+    const content = typeof message.content === "string" ? message.content : message.content?.text;
+    if (!content) return false;
+    const hasLatestKeyword = /\b(latest|new|recent)\b/i.test(content);
+    const hasBoostedKeyword = /\b(boosted|promoted|featured)\b/i.test(content);
+    const hasTokensKeyword = /\b(tokens?|coins?|crypto)\b/i.test(content);
+    return hasLatestKeyword && (hasBoostedKeyword || hasTokensKeyword);
+  }
+  async handler(runtime, message, state, _options = {}, callback) {
+    elizaLogger.log("Starting GET_LATEST_BOOSTED_TOKENS handler...");
+    try {
+      const response = await fetch("https://api.dexscreener.com/token-boosts/latest/v1", {
+        method: "GET",
+        headers: { accept: "application/json" }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const tokens = await response.json();
+      const formattedOutput = tokens.map((token) => {
+        const description = token.description || "No description available";
+        return `Chain: ${token.chainId}
+Token Address: ${token.tokenAddress}
+URL: ${token.url}
+Description: ${description}
+
+`;
+      }).join("");
+      await createTokenMemory(runtime, message, formattedOutput);
+      if (callback) {
+        await callback({ text: formattedOutput, action: this.name });
+      }
+      return true;
+    } catch (error) {
+      elizaLogger.error("Error fetching latest boosted tokens:", error);
+      if (callback) {
+        await callback({ text: `Failed to fetch latest boosted tokens: ${error.message}`, action: this.name });
+      }
+      return false;
+    }
+  }
+  examples = [[{ user: "{{user}}", content: { text: "show me the latest boosted tokens" } }, {
+    user: "{{system}}",
+    content: { text: "Here are the latest boosted tokens on DexScreener...", action: "GET_LATEST_BOOSTED_TOKENS" }
+  }]];
+};
+var topBoostedTemplate = `Determine if this is a request for top boosted tokens. If it is one of the specified situations, perform the corresponding action:
+
+Situation 1: "Get top boosted tokens"
+- Message contains: words like "top", "best", "most" AND "boosted tokens"
+- Example: "Show me the top boosted tokens" or "What are the most promoted tokens?"
+- Action: Get the tokens with most active boosts
+
+Previous conversation for context:
+{{conversation}}
+
+You are replying to: {{message}}
+`;
+var TopBoostedTokensAction = class {
+  name = "GET_TOP_BOOSTED_TOKENS";
+  similes = ["FETCH_MOST_BOOSTED_TOKENS", "CHECK_HIGHEST_BOOSTED_TOKENS", "LIST_TOP_BOOSTED_TOKENS"];
+  description = "Get tokens with most active boosts from DexScreener API";
+  suppressInitialMessage = true;
+  template = topBoostedTemplate;
+  async validate(runtime, message) {
+    const content = typeof message.content === "string" ? message.content : message.content?.text;
+    if (!content) return false;
+    const hasTopKeyword = /\b(top|best|most)\b/i.test(content);
+    const hasBoostedKeyword = /\b(boosted|promoted|featured)\b/i.test(content);
+    const hasTokensKeyword = /\b(tokens?|coins?|crypto)\b/i.test(content);
+    return hasTopKeyword && (hasBoostedKeyword || hasTokensKeyword);
+  }
+  async handler(runtime, message, state, _options = {}, callback) {
+    elizaLogger.log("Starting GET_TOP_BOOSTED_TOKENS handler...");
+    try {
+      const response = await fetch("https://api.dexscreener.com/token-boosts/top/v1", {
+        method: "GET",
+        headers: { accept: "application/json" }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const tokens = await response.json();
+      const formattedOutput = tokens.map((token) => {
+        const description = token.description || "No description available";
+        return `Chain: ${token.chainId}
+Token Address: ${token.tokenAddress}
+URL: ${token.url}
+Description: ${description}
+
+`;
+      }).join("");
+      await createTokenMemory(runtime, message, formattedOutput);
+      if (callback) {
+        await callback({ text: formattedOutput, action: this.name });
+      }
+      return true;
+    } catch (error) {
+      elizaLogger.error("Error fetching top boosted tokens:", error);
+      if (callback) {
+        await callback({ text: `Failed to fetch top boosted tokens: ${error.message}`, action: this.name });
+      }
+      return false;
+    }
+  }
+  examples = [[{ user: "{{user}}", content: { text: "show me the top boosted tokens" } }, {
+    user: "{{system}}",
+    content: {
+      text: "Here are the tokens with the most active boosts on DexScreener...",
+      action: "GET_TOP_BOOSTED_TOKENS"
+    }
+  }]];
+};
+var latestTokensAction = new LatestTokensAction();
+var latestBoostedTokensAction = new LatestBoostedTokensAction();
+var topBoostedTokensAction = new TopBoostedTokensAction();
+
+// plugins/plugin-dexscreener/src/evaluators/tokenEvaluator.ts
+var TokenPriceEvaluator = class {
+  name = "TOKEN_PRICE_EVALUATOR";
+  similes = ["price", "token price", "check price"];
+  description = "Evaluates messages for token price requests";
+  async validate(runtime, message) {
+    const content = typeof message.content === "string" ? message.content : message.content?.text;
+    if (!content) return false;
+    const hasPriceKeyword = /\b(price|value|worth|cost)\b/i.test(content);
+    const hasToken = /0x[a-fA-F0-9]{40}/.test(content) || // Ethereum address
+    /[$#][a-zA-Z]+/.test(content) || // $TOKEN or #TOKEN format
+    /\b(of|for)\s+[a-zA-Z0-9]+\b/i.test(content);
+    return hasPriceKeyword && hasToken;
+  }
+  async handler(_runtime, _message, _state) {
+    return "GET_TOKEN_PRICE";
+  }
+  examples = [{
+    context: "User asking for token price with address",
+    messages: [{
+      user: "{{user}}",
+      content: { text: "What's the price of 0x1234567890123456789012345678901234567890?", action: "GET_TOKEN_PRICE" }
+    }],
+    outcome: "GET_TOKEN_PRICE"
+  }, {
+    context: "User checking token price with $ symbol",
+    messages: [{ user: "{{user}}", content: { text: "Check price of $eth", action: "GET_TOKEN_PRICE" } }],
+    outcome: "GET_TOKEN_PRICE"
+  }, {
+    context: "User checking token price with plain symbol",
+    messages: [{ user: "{{user}}", content: { text: "What's the value for btc", action: "GET_TOKEN_PRICE" } }],
+    outcome: "GET_TOKEN_PRICE"
+  }];
+};
+var tokenPriceEvaluator = new TokenPriceEvaluator();
+
+// plugins/plugin-dexscreener/src/index.ts
+var dexScreenerPlugin = {
+  name: "dexscreener",
+  description: "Dex Screener Plugin with Token Price Action, Token Trends, Evaluators and Providers",
+  actions: [
+    new TokenPriceAction(),
+    new LatestTokensAction(),
+    new LatestBoostedTokensAction(),
+    new TopBoostedTokensAction()
+  ],
+  evaluators: [new TokenPriceEvaluator()],
+  providers: [new TokenPriceProvider()]
+};
+
+// plugins/plugin-firecrawl/src/actions/getScrapeData.ts
+import { elizaLogger as elizaLogger3 } from "@elizaos/core";
+
+// plugins/plugin-firecrawl/src/environment.ts
+import { z } from "zod";
+var firecrawlEnvSchema = z.object({ FIRECRAWL_API_KEY: z.string().min(1, "Firecrawl API key is required") });
+async function validateFirecrawlConfig(runtime) {
+  try {
+    const config = { FIRECRAWL_API_KEY: runtime.getSetting("FIRECRAWL_API_KEY") };
+    console.log("config: ", config);
+    return firecrawlEnvSchema.parse(config);
+  } catch (error) {
+    console.log("error::::", error);
+    if (error instanceof z.ZodError) {
+      const errorMessages = error.errors.map((err) => `${err.path.join(".")}: ${err.message}`).join("\n");
+      throw new Error(`Firecrawl API configuration validation failed:
+${errorMessages}`);
+    }
+    throw error;
+  }
+}
+
+// plugins/plugin-firecrawl/src/examples.ts
+var getScrapedDataExamples = [[{
+  user: "{{user1}}",
+  content: { text: "Can you scrape the content from https://example.com?" }
+}, {
+  user: "{{agent}}",
+  content: { text: "I'll scrape the content from that website for you.", action: "FIRECRAWL_GET_SCRAPED_DATA" }
+}], [{ user: "{{user1}}", content: { text: "Get the data from www.example.com/page" } }, {
+  user: "{{agent}}",
+  content: { text: "I'll scrape the data from that webpage for you.", action: "FIRECRAWL_GET_SCRAPED_DATA" }
+}], [
+  { user: "{{user1}}", content: { text: "I need to scrape some website data." } },
+  {
+    user: "{{agent}}",
+    content: { text: "I can help you scrape website data. Please share the URL you'd like me to process." }
+  },
+  { user: "{{user1}}", content: { text: "example.com/products" } },
+  {
+    user: "{{agent}}",
+    content: { text: "I'll scrape that webpage and get the data for you.", action: "FIRECRAWL_GET_SCRAPED_DATA" }
+  }
+]];
+var getSearchDataExamples = [[{
+  user: "{{user1}}",
+  content: { text: "Find the latest news about SpaceX launches." }
+}, {
+  user: "{{agentName}}",
+  content: { text: "Here is the latest news about SpaceX launches:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "Can you find details about the iPhone 16 release?" } }, {
+  user: "{{agentName}}",
+  content: { text: "Here are the details I found about the iPhone 16 release:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "What is the schedule for the next FIFA World Cup?" } }, {
+  user: "{{agentName}}",
+  content: { text: "Here is the schedule for the next FIFA World Cup:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "Check the latest stock price of Tesla." } }, {
+  user: "{{agentName}}",
+  content: { text: "Here is the latest stock price of Tesla I found:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "What are the current trending movies in the US?" } }, {
+  user: "{{agentName}}",
+  content: { text: "Here are the current trending movies in the US:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "What is the latest score in the NBA finals?" } }, {
+  user: "{{agentName}}",
+  content: { text: "Here is the latest score from the NBA finals:", action: "WEB_SEARCH" }
+}], [{ user: "{{user1}}", content: { text: "When is the next Apple keynote event?" } }, {
+  user: "{{agentName}}",
+  content: { text: "Here is the information about the next Apple keynote event:", action: "WEB_SEARCH" }
+}]];
+
+// plugins/plugin-firecrawl/src/services.ts
+import { elizaLogger as elizaLogger2 } from "@elizaos/core";
+var BASE_URL = "https://api.firecrawl.dev/v1";
+var createFirecrawlService = (apiKey) => {
+  const getScrapeData = async (url) => {
+    if (!apiKey || !url) {
+      throw new Error("Invalid parameters: API key and URL are required");
+    }
+    try {
+      const response = await fetch(`${BASE_URL}/scrape`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ url })
+      });
+      elizaLogger2.info("response: ", response);
+      console.log("data: ", response);
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error("FireCrawl API Error:", error.message);
+      throw error;
+    }
+  };
+  const getSearchData = async (query) => {
+    if (!apiKey || !query) {
+      throw new Error("Invalid parameters: API key and query are required");
+    }
+    try {
+      const response = await fetch(`${BASE_URL}/search`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ query })
+      });
+      elizaLogger2.info("response: ", response);
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error("FireCrawl API Error:", error.message);
+      throw error;
+    }
+  };
+  return { getSearchData, getScrapeData };
+};
+
+// plugins/plugin-firecrawl/src/utils.ts
+function extractUrl(text) {
+  const urlPattern = /\b(?:(?:https?|ftp):\/\/)?(?:www\.)?(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:\/[^\s\)]*)?/i;
+  const match = text.match(urlPattern);
+  if (!match) {
+    return { url: null, originalText: text };
+  }
+  let url = match[0].trim();
+  if (url.startsWith("www.")) {
+    url = `https://${url}`;
+  } else if (!url.match(/^[a-zA-Z]+:\/\//)) {
+    url = `https://${url}`;
+  }
+  return { url, originalText: text };
+}
+
+// plugins/plugin-firecrawl/src/actions/getScrapeData.ts
+var getScrapeDataAction = {
+  name: "FIRECRAWL_GET_SCRAPED_DATA",
+  similes: [
+    "SCRAPE_WEBSITE",
+    "LOOKUP",
+    "RETURN_DATA",
+    "FIND_ONLINE",
+    "QUERY",
+    "FETCH_PAGE",
+    "EXTRACT_CONTENT",
+    "GET_WEBPAGE",
+    "CRAWL_SITE",
+    "READ_WEBPAGE",
+    "PARSE_URL",
+    "GET_SITE_DATA",
+    "RETRIEVE_PAGE",
+    "SCAN_WEBSITE",
+    "ANALYZE_URL"
+  ],
+  description: "Used to scrape information from a website related to the message, summarize it and return a response.",
+  validate: async (runtime) => {
+    await validateFirecrawlConfig(runtime);
+    return true;
+  },
+  handler: async (runtime, message, state, _options, callback) => {
+    const config = await validateFirecrawlConfig(runtime);
+    const firecrawlService = createFirecrawlService(config.FIRECRAWL_API_KEY);
+    try {
+      const messageText = message.content.text || "";
+      const { url } = extractUrl(messageText);
+      if (!url) {
+        callback({ text: "No URL found in the message content." });
+        return false;
+      }
+      elizaLogger3.info(`Found URL: ${url}`);
+      const scrapeData = await firecrawlService.getScrapeData(url);
+      console.log("Final scrapeData: ", scrapeData);
+      elizaLogger3.success(`Successfully fectched crawl data`);
+      if (callback) {
+        elizaLogger3.info("response: ", scrapeData);
+        callback({ text: `Scraped data: ${JSON.stringify(scrapeData)}` });
+        return true;
+      }
+    } catch (error) {
+      elizaLogger3.error("Error in the Firecrawl plugin", error);
+      callback({ text: `Error fetching scrape data: ${error.message}`, content: { error: error.message } });
+      return false;
+    }
+  },
+  examples: getScrapedDataExamples
+};
+
+// plugins/plugin-firecrawl/src/actions/getSearchData.ts
+import { composeContext, elizaLogger as elizaLogger4, generateText } from "@elizaos/core";
+import { ModelClass } from "@elizaos/core";
+
+// plugins/plugin-firecrawl/src/templates.ts
+var getSearchDataContext = `
+{{recentMessages}}
+
+analyze the conversation history to extract search parameters:
+1. Look for explicit search terms or keywords in the most recent message
+2. Consider context from previous messages to refine the search
+3. Identify any filters or constraints mentioned (date ranges, categories, etc.)
+4. Note any sort preferences or result limitations
+
+format the extracted information into a structured search query.
+only respond with the search parameters in the specified JSON format, no additional text.
+
+`;
+var getSearchDataPrompt = `
+You are to parse data given by Firecrawl and you have to give a meaningful response
+Every search response must be human readable and make sense to the user
+`;
+
+// plugins/plugin-firecrawl/src/actions/getSearchData.ts
+var getSearchDataAction = {
+  name: "WEB_SEARCH",
+  similes: [
+    "SEARCH_WEB",
+    "INTERNET_SEARCH",
+    "LOOKUP",
+    "QUERY_WEB",
+    "FIND_ONLINE",
+    "SEARCH_ENGINE",
+    "WEB_LOOKUP",
+    "ONLINE_SEARCH",
+    "FIND_INFORMATION"
+  ],
+  description: "Perform a web search to find information related to the message.",
+  validate: async (runtime) => {
+    await validateFirecrawlConfig(runtime);
+    return true;
+  },
+  handler: async (runtime, message, state, _options, callback) => {
+    const config = await validateFirecrawlConfig(runtime);
+    const firecrawlService = createFirecrawlService(config.FIRECRAWL_API_KEY);
+    console.log(message.content.text);
+    try {
+      const messageText = message.content.text || "";
+      elizaLogger4.info(`Found data: ${messageText}`);
+      const searchData = await firecrawlService.getSearchData(messageText);
+      elizaLogger4.success(`Successfully fectched data`);
+      const context = composeContext({ state, template: getSearchDataContext });
+      const responseText = await generateText({
+        runtime,
+        context: `This was the user question
+                        ${message.content.text}
+
+                        The Response data from firecrawl Search API
+
+                        ${searchData}
+
+                     Now Summarise and use this data and provide a response to question asked`,
+        modelClass: ModelClass.SMALL,
+        customSystemPrompt: getSearchDataPrompt
+      });
+      console.log("responseText", responseText);
+      if (callback) {
+        callback({ text: `${JSON.stringify(responseText)}` });
+        return true;
+      }
+    } catch (error) {
+      elizaLogger4.error("Error in the Firecrawl plugin", error);
+      callback({ text: `Error fetching crawl data: ${error.message}`, content: { error: error.message } });
+      return false;
+    }
+  },
+  examples: getSearchDataExamples
+};
+
+// plugins/plugin-firecrawl/src/index.ts
+var firecrawlPlugin = {
+  name: "firecrawl",
+  description: "Firecrawl plugin for Eliza",
+  actions: [getSearchDataAction, getScrapeDataAction],
+  // evaluators analyze the situations and actions taken by the agent. they run after each agent action
+  // allowing the agent to reflect on what happened and potentially trigger additional actions or modifications
+  evaluators: [],
+  // providers supply information and state to the agent's context, help agent access necessary data
+  providers: []
+};
+
 // plugins/plugin-stargaze/src/actions/getCollectionStats.ts
-import { composeContext, elizaLogger as elizaLogger2, generateObjectDeprecated, ModelClass } from "@elizaos/core";
+import { composeContext as composeContext2, elizaLogger as elizaLogger6, generateObjectDeprecated, ModelClass as ModelClass2 } from "@elizaos/core";
 import axios from "axios";
 
 // plugins/plugin-stargaze/src/environment.ts
-import { z } from "zod";
-var stargazeEnvSchema = z.object({
-  STARGAZE_ENDPOINT: z.string().min(1, "Stargaze API endpoint is required")
+import { z as z2 } from "zod";
+var stargazeEnvSchema = z2.object({
+  STARGAZE_ENDPOINT: z2.string().min(1, "Stargaze API endpoint is required")
 });
 async function validateStargazeConfig(runtime) {
   try {
     const config = { STARGAZE_ENDPOINT: runtime.getSetting("STARGAZE_ENDPOINT") };
     return stargazeEnvSchema.parse(config);
   } catch (error) {
-    if (error instanceof z.ZodError) {
+    if (error instanceof z2.ZodError) {
       const errorMessages = error.errors.map((err) => `${err.path.join(".")}: ${err.message}`).join("\n");
       throw new Error(`Stargaze configuration validation failed:
 ${errorMessages}`);
@@ -42,23 +737,23 @@ ${errorMessages}`);
 }
 
 // plugins/plugin-stargaze/src/utils/debug.ts
-import { elizaLogger } from "@elizaos/core";
+import { elizaLogger as elizaLogger5 } from "@elizaos/core";
 var debugLog = {
   request: (method, url, data) => {
-    elizaLogger.log("\u{1F310} API Request:", { method, url, data: data || "No data" });
+    elizaLogger5.log("\u{1F310} API Request:", { method, url, data: data || "No data" });
   },
   response: (response) => {
-    elizaLogger.log("\u2705 API Response:", { status: response?.status, data: response?.data || "No data" });
+    elizaLogger5.log("\u2705 API Response:", { status: response?.status, data: response?.data || "No data" });
   },
   error: (error) => {
-    elizaLogger.error("\u26D4 Error Details:", {
+    elizaLogger5.error("\u26D4 Error Details:", {
       message: error?.message,
       response: { status: error?.response?.status, data: error?.response?.data },
       config: { url: error?.config?.url, method: error?.config?.method, data: error?.config?.data }
     });
   },
   validation: (config) => {
-    elizaLogger.log("\u{1F50D} Config Validation:", config);
+    elizaLogger5.log("\u{1F50D} Config Validation:", config);
   }
 };
 
@@ -111,7 +806,7 @@ var getCollectionStats_default = {
   name: "GET_COLLECTION_STATS",
   similes: ["CHECK_COLLECTION_STATS", "COLLECTION_INFO"],
   validate: async (runtime, _message) => {
-    elizaLogger2.log("\u{1F504} Validating Stargaze configuration...");
+    elizaLogger6.log("\u{1F504} Validating Stargaze configuration...");
     try {
       const config = await validateStargazeConfig(runtime);
       debugLog.validation(config);
@@ -123,22 +818,22 @@ var getCollectionStats_default = {
   },
   description: "Get detailed statistics for a Stargaze collection",
   handler: async (runtime, message, state, _options, callback) => {
-    elizaLogger2.log("\u{1F680} Starting Stargaze GET_COLLECTION_STATS handler...");
+    elizaLogger6.log("\u{1F680} Starting Stargaze GET_COLLECTION_STATS handler...");
     if (!state) {
-      elizaLogger2.log("Creating new state...");
+      elizaLogger6.log("Creating new state...");
       state = await runtime.composeState(message);
     } else {
-      elizaLogger2.log("Updating existing state...");
+      elizaLogger6.log("Updating existing state...");
       state = await runtime.updateRecentMessageState(state);
     }
     try {
-      elizaLogger2.log("Composing collection stats context...");
-      const statsContext = composeContext({ state, template: getCollectionStatsTemplate });
-      elizaLogger2.log("Generating content from context...");
+      elizaLogger6.log("Composing collection stats context...");
+      const statsContext = composeContext2({ state, template: getCollectionStatsTemplate });
+      elizaLogger6.log("Generating content from context...");
       const content = await generateObjectDeprecated({
         runtime,
         context: statsContext,
-        modelClass: ModelClass.LARGE
+        modelClass: ModelClass2.LARGE
       });
       if (!content || !content.collectionAddr) {
         throw new Error("Invalid or missing collection address in parsed content");
@@ -172,7 +867,7 @@ var getCollectionStats_default = {
 - Market Cap: ${formatValue(stats.marketCap)} USD`,
           content: stats
         };
-        elizaLogger2.log("\u2705 Sending callback with collection stats:", message2);
+        elizaLogger6.log("\u2705 Sending callback with collection stats:", message2);
         callback(message2);
       }
       return true;
@@ -199,7 +894,7 @@ var getCollectionStats_default = {
 };
 
 // plugins/plugin-stargaze/src/actions/getLatestNFT.ts
-import { composeContext as composeContext2, elizaLogger as elizaLogger3, generateObjectDeprecated as generateObjectDeprecated2, ModelClass as ModelClass2 } from "@elizaos/core";
+import { composeContext as composeContext3, elizaLogger as elizaLogger7, generateObjectDeprecated as generateObjectDeprecated2, ModelClass as ModelClass3 } from "@elizaos/core";
 import axios2 from "axios";
 var getLatestNFTTemplate = `Given the message, extract information about the NFT collection request.
 
@@ -257,7 +952,7 @@ var getLatestNFT_default = {
   name: "GET_LATEST_NFT",
   similes: ["SHOW_LATEST_NFT", "FETCH_LATEST_NFT"],
   validate: async (runtime, _message) => {
-    elizaLogger3.log("\u{1F504} Validating Stargaze configuration...");
+    elizaLogger7.log("\u{1F504} Validating Stargaze configuration...");
     try {
       const config = await validateStargazeConfig(runtime);
       debugLog.validation(config);
@@ -269,22 +964,22 @@ var getLatestNFT_default = {
   },
   description: "Get the latest NFT from a Stargaze collection",
   handler: async (runtime, message, state, _options, callback) => {
-    elizaLogger3.log("\u{1F680} Starting Stargaze GET_LATEST_NFT handler...");
+    elizaLogger7.log("\u{1F680} Starting Stargaze GET_LATEST_NFT handler...");
     if (!state) {
-      elizaLogger3.log("Creating new state...");
+      elizaLogger7.log("Creating new state...");
       state = await runtime.composeState(message);
     } else {
-      elizaLogger3.log("Updating existing state...");
+      elizaLogger7.log("Updating existing state...");
       state = await runtime.updateRecentMessageState(state);
     }
     try {
-      elizaLogger3.log("Composing NFT context...");
-      const nftContext = composeContext2({ state, template: getLatestNFTTemplate });
-      elizaLogger3.log("Generating content from context...");
+      elizaLogger7.log("Composing NFT context...");
+      const nftContext = composeContext3({ state, template: getLatestNFTTemplate });
+      elizaLogger7.log("Generating content from context...");
       const content = await generateObjectDeprecated2({
         runtime,
         context: nftContext,
-        modelClass: ModelClass2.LARGE
+        modelClass: ModelClass3.LARGE
       });
       if (!content || !content.collectionAddr) {
         throw new Error("Invalid or missing collection address in parsed content");
@@ -315,7 +1010,7 @@ Token ID: ${latestNFT.tokenId}
 Image: ${latestNFT.media.url}`,
           content: latestNFT
         };
-        elizaLogger3.log("\u2705 Sending callback with NFT data:", message2);
+        elizaLogger7.log("\u2705 Sending callback with NFT data:", message2);
         callback(message2);
       }
       return true;
@@ -337,7 +1032,7 @@ Image: ${latestNFT.media.url}`,
 };
 
 // plugins/plugin-stargaze/src/actions/getTokenSales.ts
-import { composeContext as composeContext3, elizaLogger as elizaLogger4, generateObjectDeprecated as generateObjectDeprecated3, ModelClass as ModelClass3 } from "@elizaos/core";
+import { composeContext as composeContext4, elizaLogger as elizaLogger8, generateObjectDeprecated as generateObjectDeprecated3, ModelClass as ModelClass4 } from "@elizaos/core";
 import axios3 from "axios";
 var getTokenSalesTemplate = `Given the message, extract the collection address for fetching Stargaze sales data.
 
@@ -390,7 +1085,7 @@ var getTokenSales_default = {
   name: "GET_TOKEN_SALES",
   similes: ["CHECK_SALES", "RECENT_SALES"],
   validate: async (runtime, _message) => {
-    elizaLogger4.log("\u{1F504} Validating Stargaze configuration...");
+    elizaLogger8.log("\u{1F504} Validating Stargaze configuration...");
     try {
       const config = await validateStargazeConfig(runtime);
       debugLog.validation(config);
@@ -402,22 +1097,22 @@ var getTokenSales_default = {
   },
   description: "Get recent sales data for a Stargaze collection",
   handler: async (runtime, message, state, _options, callback) => {
-    elizaLogger4.log("\u{1F680} Starting Stargaze GET_TOKEN_SALES handler...");
+    elizaLogger8.log("\u{1F680} Starting Stargaze GET_TOKEN_SALES handler...");
     if (!state) {
-      elizaLogger4.log("Creating new state...");
+      elizaLogger8.log("Creating new state...");
       state = await runtime.composeState(message);
     } else {
-      elizaLogger4.log("Updating existing state...");
+      elizaLogger8.log("Updating existing state...");
       state = await runtime.updateRecentMessageState(state);
     }
     try {
-      elizaLogger4.log("Composing sales context...");
-      const salesContext = composeContext3({ state, template: getTokenSalesTemplate });
-      elizaLogger4.log("Generating content from context...");
+      elizaLogger8.log("Composing sales context...");
+      const salesContext = composeContext4({ state, template: getTokenSalesTemplate });
+      elizaLogger8.log("Generating content from context...");
       const content = await generateObjectDeprecated3({
         runtime,
         context: salesContext,
-        modelClass: ModelClass3.LARGE
+        modelClass: ModelClass4.LARGE
       });
       if (!content || !content.collectionAddr) {
         throw new Error("Invalid or missing collection address in parsed content");
@@ -493,11 +1188,322 @@ var stargazePlugin = {
   providers: []
 };
 
+// plugins/plugin-twitter/src/actions/post.ts
+import { composeContext as composeContext5, elizaLogger as elizaLogger9, generateObject, ModelClass as ModelClass5 } from "@elizaos/core";
+import { Scraper } from "agent-twitter-client";
+
+// plugins/plugin-twitter/src/templates.ts
+var tweetTemplate = `
+# Context
+{{recentMessages}}
+
+# Topics
+{{topics}}
+
+# Post Directions
+{{postDirections}}
+
+# Recent interactions between {{agentName}} and other users:
+{{recentPostInteractions}}
+
+# Task
+Generate a tweet that:
+1. Relates to the recent conversation or requested topic
+2. Matches the character's style and voice
+3. Is concise and engaging
+4. Must be UNDER 180 characters (this is a strict requirement)
+5. Speaks from the perspective of {{agentName}}
+
+Generate only the tweet text, no other commentary.
+
+Return the tweet in JSON format like: {"text": "your tweet here"}`;
+
+// plugins/plugin-twitter/src/types.ts
+import { z as z3 } from "zod";
+var TweetSchema = z3.object({ text: z3.string().describe("The text of the tweet") });
+var isTweetContent = (obj) => {
+  return TweetSchema.safeParse(obj).success;
+};
+
+// plugins/plugin-twitter/src/actions/post.ts
+var DEFAULT_MAX_TWEET_LENGTH = 280;
+function truncateToCompleteSentence(text, maxLength) {
+  if (text.length <= maxLength) return text;
+  const truncated = text.substring(0, maxLength);
+  const lastPeriod = truncated.lastIndexOf(".");
+  const lastQuestion = truncated.lastIndexOf("?");
+  const lastExclamation = truncated.lastIndexOf("!");
+  const lastSentenceEnd = Math.max(lastPeriod, lastQuestion, lastExclamation);
+  return lastSentenceEnd > 0 ? truncated.substring(0, lastSentenceEnd + 1) : truncated;
+}
+async function composeTweet(runtime, _message, state) {
+  try {
+    const context = composeContext5({ state, template: tweetTemplate });
+    const tweetContentObject = await generateObject({ runtime, context, modelClass: ModelClass5.SMALL, stop: ["\n"] });
+    if (!isTweetContent(tweetContentObject.object)) {
+      elizaLogger9.error("Invalid tweet content:", tweetContentObject.object);
+      return;
+    }
+    let trimmedContent = tweetContentObject.object.text.trim();
+    const maxTweetLength = runtime.getSetting("MAX_TWEET_LENGTH");
+    if (maxTweetLength) {
+      trimmedContent = truncateToCompleteSentence(trimmedContent, Number(maxTweetLength));
+    }
+    return trimmedContent;
+  } catch (error) {
+    elizaLogger9.error("Error composing tweet:", error);
+    throw error;
+  }
+}
+async function sendTweet(twitterClient, content) {
+  const result = await twitterClient.sendTweet(content);
+  const body = await result.json();
+  elizaLogger9.log("Tweet response:", body);
+  if (body.errors) {
+    const error = body.errors[0];
+    elizaLogger9.error(`Twitter API error (${error.code}): ${error.message}`);
+    return false;
+  }
+  if (!body?.data?.create_tweet?.tweet_results?.result) {
+    elizaLogger9.error("Failed to post tweet: No tweet result in response");
+    return false;
+  }
+  return true;
+}
+async function postTweet(runtime, content) {
+  try {
+    const twitterClient = runtime.clients.twitter?.client?.twitterClient;
+    const scraper = twitterClient || new Scraper();
+    if (!twitterClient) {
+      const username = runtime.getSetting("TWITTER_USERNAME");
+      const password = runtime.getSetting("TWITTER_PASSWORD");
+      const email = runtime.getSetting("TWITTER_EMAIL");
+      const twitter2faSecret = runtime.getSetting("TWITTER_2FA_SECRET");
+      if (!username || !password) {
+        elizaLogger9.error("Twitter credentials not configured in environment");
+        return false;
+      }
+      await scraper.login(username, password, email, twitter2faSecret);
+      if (!await scraper.isLoggedIn()) {
+        elizaLogger9.error("Failed to login to Twitter");
+        return false;
+      }
+    }
+    elizaLogger9.log("Attempting to send tweet:", content);
+    try {
+      if (content.length > DEFAULT_MAX_TWEET_LENGTH) {
+        const noteTweetResult = await scraper.sendNoteTweet(content);
+        if (noteTweetResult.errors && noteTweetResult.errors.length > 0) {
+          return await sendTweet(scraper, content);
+        }
+        return true;
+      }
+      return await sendTweet(scraper, content);
+    } catch (error) {
+      throw new Error(`Note Tweet failed: ${error}`);
+    }
+  } catch (error) {
+    elizaLogger9.error("Error posting tweet:", {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      cause: error.cause
+    });
+    return false;
+  }
+}
+var postAction = {
+  name: "POST_TWEET",
+  similes: ["TWEET", "POST", "SEND_TWEET"],
+  description: "Post a tweet to Twitter",
+  validate: async (runtime, _message, _state) => {
+    const username = runtime.getSetting("TWITTER_USERNAME");
+    const password = runtime.getSetting("TWITTER_PASSWORD");
+    const email = runtime.getSetting("TWITTER_EMAIL");
+    const hasCredentials = !!username && !!password && !!email;
+    elizaLogger9.log(`Has credentials: ${hasCredentials}`);
+    return hasCredentials;
+  },
+  handler: async (runtime, message, state) => {
+    try {
+      const tweetContent = await composeTweet(runtime, message, state);
+      if (!tweetContent) {
+        elizaLogger9.error("No content generated for tweet");
+        return false;
+      }
+      elizaLogger9.log(`Generated tweet content: ${tweetContent}`);
+      if (process.env.TWITTER_DRY_RUN && process.env.TWITTER_DRY_RUN.toLowerCase() === "true") {
+        elizaLogger9.info(`Dry run: would have posted tweet: ${tweetContent}`);
+        return true;
+      }
+      return await postTweet(runtime, tweetContent);
+    } catch (error) {
+      elizaLogger9.error("Error in post action:", error);
+      return false;
+    }
+  },
+  examples: [[{ user: "{{user1}}", content: { text: "You should tweet that" } }, {
+    user: "{{agentName}}",
+    content: { text: "I'll share this update with my followers right away!", action: "POST_TWEET" }
+  }], [{ user: "{{user1}}", content: { text: "Post this tweet" } }, {
+    user: "{{agentName}}",
+    content: { text: "I'll post that as a tweet now.", action: "POST_TWEET" }
+  }], [{ user: "{{user1}}", content: { text: "Share that on Twitter" } }, {
+    user: "{{agentName}}",
+    content: { text: "I'll share this message on Twitter.", action: "POST_TWEET" }
+  }], [{ user: "{{user1}}", content: { text: "Post that on X" } }, {
+    user: "{{agentName}}",
+    content: { text: "I'll post this message on X right away.", action: "POST_TWEET" }
+  }], [{ user: "{{user1}}", content: { text: "You should put that on X dot com" } }, {
+    user: "{{agentName}}",
+    content: { text: "I'll put this message up on X.com now.", action: "POST_TWEET" }
+  }]]
+};
+
+// plugins/plugin-twitter/src/index.ts
+var twitterPlugin = {
+  name: "twitter",
+  description: "Twitter integration plugin for posting tweets",
+  actions: [postAction],
+  evaluators: [],
+  providers: []
+};
+
+// plugins/plugin-web-search/src/actions/webSearch.ts
+import { elizaLogger as elizaLogger10 } from "@elizaos/core";
+import { encodingForModel } from "js-tiktoken";
+
+// plugins/plugin-web-search/src/services/webSearchService.ts
+import { Service } from "@elizaos/core";
+import { tavily } from "@tavily/core";
+var WebSearchService = class _WebSearchService extends Service {
+  tavilyClient;
+  async initialize(_runtime) {
+    const apiKey = _runtime.getSetting("TAVILY_API_KEY");
+    if (!apiKey) {
+      throw new Error("TAVILY_API_KEY is not set");
+    }
+    this.tavilyClient = tavily({ apiKey });
+  }
+  getInstance() {
+    return _WebSearchService.getInstance();
+  }
+  static get serviceType() {
+    return "web_search";
+  }
+  async search(query, options) {
+    try {
+      const response = await this.tavilyClient.search(query, {
+        includeAnswer: options?.includeAnswer || true,
+        maxResults: options?.limit || 3,
+        topic: options?.type || "general",
+        searchDepth: options?.searchDepth || "basic",
+        includeImages: options?.includeImages || false,
+        days: options?.days || 3
+      });
+      return response;
+    } catch (error) {
+      console.error("Web search error:", error);
+      throw error;
+    }
+  }
+};
+
+// plugins/plugin-web-search/src/actions/webSearch.ts
+var DEFAULT_MAX_WEB_SEARCH_TOKENS = 4e3;
+var DEFAULT_MODEL_ENCODING = "gpt-3.5-turbo";
+function getTotalTokensFromString(str, encodingName = DEFAULT_MODEL_ENCODING) {
+  const encoding = encodingForModel(encodingName);
+  return encoding.encode(str).length;
+}
+function MaxTokens(data, maxTokens = DEFAULT_MAX_WEB_SEARCH_TOKENS) {
+  if (getTotalTokensFromString(data) >= maxTokens) {
+    return data.slice(0, maxTokens);
+  }
+  return data;
+}
+var webSearch = {
+  name: "WEB_SEARCH",
+  similes: [
+    "SEARCH_WEB",
+    "INTERNET_SEARCH",
+    "LOOKUP",
+    "QUERY_WEB",
+    "FIND_ONLINE",
+    "SEARCH_ENGINE",
+    "WEB_LOOKUP",
+    "ONLINE_SEARCH",
+    "FIND_INFORMATION"
+  ],
+  suppressInitialMessage: true,
+  description: "Perform a web search to find information related to the message.",
+  // eslint-disable-next-line
+  validate: async (runtime, message) => {
+    const tavilyApiKeyOk = !!runtime.getSetting("TAVILY_API_KEY");
+    return tavilyApiKeyOk;
+  },
+  handler: async (runtime, message, state, options, callback) => {
+    elizaLogger10.log("Composing state for message:", message);
+    state = await runtime.composeState(message);
+    const userId = runtime.agentId;
+    elizaLogger10.log("User ID:", userId);
+    const webSearchPrompt = message.content.text;
+    elizaLogger10.log("web search prompt received:", webSearchPrompt);
+    const webSearchService = new WebSearchService();
+    await webSearchService.initialize(runtime);
+    const searchResponse = await webSearchService.search(webSearchPrompt);
+    if (searchResponse && searchResponse.results.length) {
+      const responseList = searchResponse.answer ? `${searchResponse.answer}${Array.isArray(searchResponse.results) && searchResponse.results.length > 0 ? `
+
+For more details, you can check out these resources:
+${searchResponse.results.map(
+        (result, index) => `${index + 1}. [${result.title}](${result.url})`
+      ).join("\n")}` : ""}` : "";
+      callback({ text: MaxTokens(responseList, DEFAULT_MAX_WEB_SEARCH_TOKENS) });
+    } else {
+      elizaLogger10.error("search failed or returned no data.");
+    }
+  },
+  examples: [[{ user: "{{user1}}", content: { text: "Find the latest news about SpaceX launches." } }, {
+    user: "{{agentName}}",
+    content: { text: "Here is the latest news about SpaceX launches:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "Can you find details about the iPhone 16 release?" } }, {
+    user: "{{agentName}}",
+    content: { text: "Here are the details I found about the iPhone 16 release:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "What is the schedule for the next FIFA World Cup?" } }, {
+    user: "{{agentName}}",
+    content: { text: "Here is the schedule for the next FIFA World Cup:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "Check the latest stock price of Tesla." } }, {
+    user: "{{agentName}}",
+    content: { text: "Here is the latest stock price of Tesla I found:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "What are the current trending movies in the US?" } }, {
+    user: "{{agentName}}",
+    content: { text: "Here are the current trending movies in the US:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "What is the latest score in the NBA finals?" } }, {
+    user: "{{agentName}}",
+    content: { text: "Here is the latest score from the NBA finals:", action: "WEB_SEARCH" }
+  }], [{ user: "{{user1}}", content: { text: "When is the next Apple keynote event?" } }, {
+    user: "{{agentName}}",
+    content: { text: "Here is the information about the next Apple keynote event:", action: "WEB_SEARCH" }
+  }]]
+};
+
+// plugins/plugin-web-search/src/index.ts
+var webSearchPlugin = {
+  name: "webSearch",
+  description: "Search the web and get news",
+  actions: [webSearch],
+  evaluators: [],
+  providers: [],
+  services: [new WebSearchService()],
+  clients: []
+};
+
 // src/character.ts
 var character = {
   name: "Mousekenstein",
   username: "Mousekenstein",
-  plugins: [stargazePlugin],
+  plugins: [stargazePlugin, dexScreenerPlugin, webSearchPlugin, twitterPlugin, firecrawlPlugin],
   clients: [Clients.DISCORD],
   modelProvider: ModelProviderName.OPENAI,
   settings: { secrets: {}, voice: { model: "en_US-male-medium" } },
@@ -862,7 +1868,7 @@ var wait = (minTime = 1e3, maxTime = 3e3) => {
 };
 var nodePlugin;
 function createAgent(character2, db, cache, token) {
-  elizaLogger5.success(elizaLogger5.successesTitle, "Creating runtime for character", character2.name);
+  elizaLogger11.success(elizaLogger11.successesTitle, "Creating runtime for character", character2.name);
   nodePlugin ??= createNodePlugin();
   return new AgentRuntime({
     databaseAdapter: db,
@@ -894,10 +1900,10 @@ async function startAgent(character2, directClient) {
     await runtime.initialize();
     runtime.clients = await initializeClients(character2, runtime);
     directClient.registerAgent(runtime);
-    elizaLogger5.debug(`Started ${character2.name} as ${runtime.agentId}`);
+    elizaLogger11.debug(`Started ${character2.name} as ${runtime.agentId}`);
     return runtime;
   } catch (error) {
-    elizaLogger5.error(`Error starting agent for character ${character2.name}:`, error);
+    elizaLogger11.error(`Error starting agent for character ${character2.name}:`, error);
     console.error(error);
     throw error;
   }
@@ -933,10 +1939,10 @@ var startAgents = async () => {
       await startAgent(character2, directClient);
     }
   } catch (error) {
-    elizaLogger5.error("Error starting agents:", error);
+    elizaLogger11.error("Error starting agents:", error);
   }
   while (!await checkPortAvailable(serverPort)) {
-    elizaLogger5.warn(`Port ${serverPort} is in use, trying ${serverPort + 1}`);
+    elizaLogger11.warn(`Port ${serverPort} is in use, trying ${serverPort + 1}`);
     serverPort++;
   }
   directClient.startAgent = async (character2) => {
@@ -944,17 +1950,17 @@ var startAgents = async () => {
   };
   directClient.start(serverPort);
   if (serverPort !== parseInt(settings3.SERVER_PORT || "3000")) {
-    elizaLogger5.log(`Server started on alternate port ${serverPort}`);
+    elizaLogger11.log(`Server started on alternate port ${serverPort}`);
   }
   const isDaemonProcess = process.env.DAEMON_PROCESS === "true";
   if (!isDaemonProcess) {
-    elizaLogger5.log("Chat started. Type 'exit' to quit.");
+    elizaLogger11.log("Chat started. Type 'exit' to quit.");
     const chat = startChat(characters);
     chat();
   }
 };
 startAgents().catch((error) => {
-  elizaLogger5.error("Unhandled error in startAgents:", error);
+  elizaLogger11.error("Unhandled error in startAgents:", error);
   process.exit(1);
 });
 export {
