@@ -10,7 +10,7 @@ export type firecrawlConfig = z.infer<typeof firecrawlEnvSchema>;
 export async function validateFirecrawlConfig(runtime: IAgentRuntime): Promise<firecrawlConfig> {
   try {
     const config = { FIRECRAWL_API_KEY: runtime.getSetting('FIRECRAWL_API_KEY') };
-    console.log('config: ', config);
+    // console.log('config: ', config); // ONLY ACTIVATE FOR TESTING PURPOSES
     return firecrawlEnvSchema.parse(config);
   } catch (error) {
     console.log('error::::', error);

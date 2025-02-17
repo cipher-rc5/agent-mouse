@@ -1,4 +1,5 @@
 // plugins/plugin-firecrawl/src/actions/getScrapeData.ts
+
 import { Action, ActionExample, elizaLogger, HandlerCallback, IAgentRuntime, Memory, State } from '@elizaos/core';
 import { validateFirecrawlConfig } from '../environment.ts';
 import { getScrapedDataExamples } from '../examples.ts';

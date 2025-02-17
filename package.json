@@ -4,8 +4,9 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "clean": "rm -rf .aider.tags.cache.v3 dist data",
-    "clean:all": "rm -rf node_modules .aider.tags.cache.v3 content_cache dist data",
+    "reload:better-sqlite3": "pnpm build && cd node_modules/better-sqlite3 && pnpm rebuild && cd ../.. && pnpm start",
+    "clean": "rm -rf .aider.tags.cache.v3 dist",
+    "clean:all": "rm -rf .aider.tags.cache.v3 node_modules content_cache dist data",
     "build": "tsup src/index.ts --format esm --dts",
     "start": "tsc && node --loader ts-node/esm src/index.ts",
     "start:service:all": "pm2 start pnpm --name=\"all\" --restart-delay=3000 --max-restarts=10 -- run start:all",

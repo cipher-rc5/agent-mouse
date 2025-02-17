@@ -62,10 +62,6 @@ export const getSearchDataAction: Action = {
 
       console.log('responseText', responseText);
 
-      // const parsedResponse = parseJSONObjectFromText(responseText);
-
-      // console.log("parsedResponse", parsedResponse);
-
       if (callback) {
         callback({ text: `${JSON.stringify(responseText)}` });
         return true;
